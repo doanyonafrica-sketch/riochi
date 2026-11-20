@@ -1,0 +1,8 @@
+node_modules/
+dist-electron/
+out/
+*.log
+.DS_Store
+# Clés de signature : ne jamais les versionner
+*.jks
+*.keystore

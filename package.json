@@ -1,0 +1,75 @@
+{
+  "name": "riochi",
+  "productName": "Riochi",
+  "version": "1.0.0",
+  "description": "Riochi : recherche d'anime et lecture (APK Android via Capacitor, EXE Windows via Electron).",
+  "private": true,
+  "author": "Riochi",
+  "main": "electron/main.js",
+  "scripts": {
+    "sync": "cap sync android",
+    "android:open": "cap open android",
+    "android:debug": "cap sync android && cd android && ./gradlew assembleDebug",
+    "android:release": "cap sync android && cd android && ./gradlew assembleRelease",
+    "electron": "electron .",
+    "electron:build": "electron-builder --win --x64",
+    "assets": "node scripts/make-icons.mjs && capacitor-assets generate --android --assetPath resources"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.6.2",
+    "@capacitor/core": "^8.6.2"
+  },
+  "devDependencies": {
+    "@capacitor/assets": "^4.0.0",
+    "@capacitor/cli": "^8.6.2",
+    "electron": "^45.4.1",
+    "electron-builder": "^26.18.0"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "build": {
+    "appId": "fr.riochi.app",
+    "productName": "Riochi",
+    "copyright": "Riochi",
+    "directories": {
+      "output": "dist-electron",
+      "buildResources": "resources"
+    },
+    "files": [
+      "electron/**/*",
+      "www/**/*",
+      "resources/icon.png",
+      "package.json",
+      "!**/node_modules/**"
+    ],
+    "asar": true,
+    "win": {
+      "icon": "resources/icon.png",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "shortcutName": "Riochi",
+      "artifactName": "Riochi-${version}-Setup.${ext}"
+    },
+    "portable": {
+      "artifactName": "Riochi-${version}-Portable.${ext}"
+    }
+  }
+}

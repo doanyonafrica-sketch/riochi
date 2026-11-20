@@ -1,0 +1,17 @@
+{
+  "appId": "fr.riochi.app",
+  "appName": "Riochi",
+  "webDir": "www",
+  "backgroundColor": "#16132a",
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "allowMixedContent": true
+  },
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": true
+    }
+  }
+}
