@@ -61,13 +61,31 @@
   };
   const readJson = (k, d) => { try { const v = JSON.parse(store.get(k)); return v == null ? d : v; } catch (e) { return d; } };
   const tag = (list, group, extra) => (list || []).map((p) => Object.assign({}, p, { group }, extra || {}));
-  const builtin = [].concat(
+  const buildBuiltin = () => [].concat(
     tag(window.RIOCHI_DEFAULTS, "fr-base"),
     tag(window.RIOCHI_ANIX, "anix"),
     tag(window.RIOCHI_ADULT, "adult", { adult: true }),
     window.RIOCHI_DEMO ? tag([window.RIOCHI_DEMO], "demo") : []
   ).filter((s, i, all) => all.findIndex((x) => x.id === s.id) === i);
+  let builtin = buildBuiltin();
   let custom = readJson(KEY, []).filter((s) => !builtin.some((b) => b.id === s.id));
+  // Les autres langues et les sources 18+ ne sont chargées que si on les demande (démarrage plus léger).
+  let moreLoaded = false, moreLoading = null;
+  function loadMore() {
+    if (moreLoaded) return Promise.resolve();
+    if (moreLoading) return moreLoading;
+    const load = (src) => new Promise((res, rej) => {
+      const t = document.createElement("script");
+      t.src = src; t.onload = res; t.onerror = () => rej(new Error("fichier " + src + " introuvable"));
+      document.head.append(t);
+    });
+    moreLoading = load("js/sources-anix.js").then(() => load("js/sources-18.js")).then(() => {
+      builtin = buildBuiltin();
+      custom = custom.filter((c) => !builtin.some((b) => b.id === c.id));
+      moreLoaded = true;
+    }).finally(() => { moreLoading = null; });
+    return moreLoading;
+  }
   let state = readJson(STATE, {});
   let adultOn = store.get(ADULT) === "1";
   // Par défaut : les sources françaises, l'exemple et tes ajouts. Le reste s'active à la main.
@@ -174,13 +192,24 @@
   let homeData = null;
   function loadHome() {
     if (homeData) return Promise.resolve(homeData);
+    const cached = readJson("riochi.home", null);
+    const fresh = cached && cached.data && Date.now() - cached.at < 6 * 3600 * 1000;
     const now = new Date();
     const season = ["WINTER", "SPRING", "SUMMER", "FALL"][Math.floor(now.getMonth() / 3)];
     const q = `query($season:MediaSeason,$year:Int){
       trending:Page(perPage:12){media(type:ANIME,sort:TRENDING_DESC,isAdult:false){${MEDIA}}}
       season:Page(perPage:12){media(type:ANIME,season:$season,seasonYear:$year,sort:POPULARITY_DESC,isAdult:false){${MEDIA}}}
       top:Page(perPage:12){media(type:ANIME,sort:SCORE_DESC,isAdult:false){${MEDIA}}}}`;
-    return anilist(q, { season, year: now.getFullYear() }).then((d) => (homeData = d));
+    const fetchIt = () => anilist(q, { season, year: now.getFullYear() }).then((d) => {
+      store.set("riochi.home", JSON.stringify({ at: Date.now(), data: d }));
+      return d;
+    });
+    if (cached && cached.data) {
+      homeData = cached.data;
+      if (!fresh) fetchIt().catch(() => {});
+      return Promise.resolve(homeData);
+    }
+    return fetchIt().then((d) => (homeData = d));
   }
 
   // ---------------------------------------------------------------- recherche
@@ -258,28 +287,42 @@
       out.replaceChildren(el("p", { class: "empty" }, "Recherche en cours…"));
       const token = ++searchToken;
       const asked = media || {};
-      const res = await Promise.all(active().map(async (src) => {
+      const srcs = active();
+      const results = new Array(srcs.length).fill(null);
+      let pending = srcs.length;
+      const paint = () => {
+        if (token !== searchToken) return;
+        const done = results.filter(Boolean);
+        lastRes = done.filter((r) => r.items.length);
+        const cards = done.flatMap(({ src, items }) => items.map((r) => card(src, r)));
+        const errors = done.filter((r) => r.error).map((r) => el("p", { class: "mut" }, r.src.name + " : " + r.error));
+        out.replaceChildren(
+          cards.length ? el("div", { class: "grid", style: "margin-top:20px" }, cards) : null,
+          pending ? el("p", { class: "empty" }, "Recherche en cours… (" + (srcs.length - pending) + "/" + srcs.length + " sources)")
+            : !cards.length ? el("p", { class: "empty" }, "Aucun résultat dans tes sources.") : null,
+          ...errors,
+          !pending && done.some((r) => r.error && /unreachable|Failed to fetch|NetworkError/i.test(r.error))
+            ? el("p", { class: "mut" }, "Dans un navigateur, les sites d'anime bloquent les appels des plugins (CORS) : les sources FR ne marcheront que dans l'application Android.")
+            : null
+        );
+      };
+      await Promise.all(srcs.map(async (src, n) => {
+        let r;
         try {
           const p = providerOf(src);
           const st = (p.getSettings && p.getSettings()) || {};
-          if (lastDub && st.supportsDub === false) return { src, items: [] };
-          const items = await withTimeout(p.search({ query: q, dub: lastDub, media: asked }), 30000);
-          return { src, items: Array.isArray(items) ? items : [] };
+          if (lastDub && st.supportsDub === false) r = { src, items: [] };
+          else {
+            const items = await withTimeout(p.search({ query: q, dub: lastDub, media: asked }), 30000);
+            r = { src, items: Array.isArray(items) ? items : [] };
+          }
         } catch (e) {
-          return { src, items: [], error: msg(e) };
+          r = { src, items: [], error: msg(e) };
         }
+        results[n] = r;
+        pending--;
+        paint();
       }));
-      if (token !== searchToken) return;
-      lastRes = res.filter((r) => r.items.length);
-      const cards = res.flatMap(({ src, items }) => items.map((r) => card(src, r)));
-      const errors = res.filter((r) => r.error).map((r) => el("p", { class: "mut" }, r.src.name + " : " + r.error));
-      out.replaceChildren(
-        cards.length ? el("div", { class: "grid", style: "margin-top:20px" }, cards) : el("p", { class: "empty" }, "Aucun résultat dans tes sources."),
-        ...errors,
-        res.some((r) => r.error && /unreachable|Failed to fetch|NetworkError/i.test(r.error))
-          ? el("p", { class: "mut" }, "Dans un navigateur, les sites d'anime bloquent les appels des plugins (CORS) : les sources FR ne marcheront que dans l'application Android.")
-          : null
-      );
     }
 
     if (lastQuery) run(); else showHome();
@@ -299,6 +342,20 @@
 
   // ---------------------------------------------------------------- détail et épisodes
   let session = null;
+  // Épisodes vus, gardés sur l'appareil par titre : coche sur la liste et bouton « Reprendre ».
+  const seenKey = () => "riochi.seen." + session.title.toLowerCase() + (lastDub ? "|vf" : "");
+  const readSeen = () => readJson(seenKey(), { eps: {}, last: -1 });
+  function paintEps() {
+    if (!session || !session.chips) return;
+    const d = readSeen();
+    session.chips.forEach((c, i) => { c.classList.toggle("seen", Boolean(d.eps[i])); c.classList.toggle("now", i === session.index && $("#player").open); });
+  }
+  function markSeen() {
+    const d = readSeen();
+    d.eps[session.index] = 1; d.last = session.index;
+    store.set(seenKey(), JSON.stringify(d));
+    paintEps();
+  }
 
   async function openDetail(src, r, title) {
     const d = $("#detail");
@@ -319,8 +376,16 @@
       // La source ouverte d'abord, puis les autres sources qui ont trouvé cet anime (changement possible dans le lecteur).
       const alts = lastRes.filter((x) => x.src.id !== src.id).map((x) => ({ src: x.src, item: x.items[0], episodes: null }));
       session = { title, index: 0, cur: 0, entries: [{ src, item: r, episodes: list }].concat(alts) };
-      list.forEach((ep, i) =>
-        eps.append(el("li", {}, el("button", { onclick: () => openPlayer(i) }, ep.title || "Épisode " + (ep.number ?? i + 1)))));
+      session.chips = [];
+      list.forEach((ep, i) => {
+        const chip = el("button", { title: ep.title || "", onclick: () => openPlayer(i) }, String(ep.number ?? i + 1));
+        session.chips.push(chip);
+        eps.append(el("li", {}, chip));
+      });
+      const seen = readSeen();
+      if (seen.last >= 0 && seen.last < list.length)
+        eps.before(el("button", { class: "ac resume", onclick: () => openPlayer(seen.last) }, "Reprendre · épisode " + (list[seen.last].number ?? seen.last + 1)));
+      paintEps();
     } catch (e) {
       info.textContent = "Épisodes introuvables : " + msg(e);
     }
@@ -334,10 +399,33 @@
     const psrc = el("select", { id: "psrc", "aria-label": "Source", hidden: true });
     const psel = el("select", { id: "psel", "aria-label": "Version", hidden: true });
     psrc.onchange = () => { session.cur = Number(psrc.value); playEpisode(session.index, true); };
+    const seek = (d) => { const v = $("#video"); v.currentTime = Math.max(0, v.currentTime + d); };
     $("#video").after(
-      el("div", { id: "pctl", style: "display:flex;gap:8px;flex-wrap:wrap;padding:8px 16px 0" }, psrc, psel),
-      el("p", { class: "mut", id: "pstat", role: "status", style: "padding:8px 16px 0" })
+      el("div", { id: "pctl" },
+        psrc, psel,
+        el("button", { type: "button", "aria-label": "Reculer de 10 secondes", onclick: () => seek(-10) }, "⟲ 10 s"),
+        el("button", { type: "button", "aria-label": "Avancer de 10 secondes", onclick: () => seek(10) }, "10 s ⟳"),
+        el("button", { type: "button", id: "pfs", onclick: () => setCinema(!$("#player").classList.contains("cinema")) }, "⛶ Plein écran")),
+      el("p", { class: "mut", id: "pstat", role: "status" })
     );
+  }
+
+  // Plein écran : la fenêtre remplit l'écran et on demande le mode paysage (si le système le permet).
+  function setCinema(on) {
+    const p = $("#player");
+    p.classList.toggle("cinema", on);
+    const b = $("#pfs");
+    if (b) b.textContent = on ? "✕ Quitter" : "⛶ Plein écran";
+    try {
+      if (on) {
+        const r = p.requestFullscreen || p.webkitRequestFullscreen;
+        if (r) { const x = r.call(p); if (x && x.catch) x.catch(() => {}); }
+        if (screen.orientation && screen.orientation.lock) screen.orientation.lock("landscape").catch(() => {});
+      } else {
+        if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
+        if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock();
+      }
+    } catch (e) { /* tant pis : le plein écran « maison » reste actif */ }
   }
 
   function stopVideo() {
@@ -406,6 +494,8 @@
     psrc.value = String(s.cur);
     psrc.hidden = s.entries.length < 2;
     netLog.length = 0;
+    $("#video").onended = () => { if (session === s && s.index === i && i < s.entries[0].episodes.length - 1) playEpisode(i + 1); };
+    paintEps();
 
     const order = explicit ? [s.cur] : [s.cur].concat(s.entries.map((_, k) => k).filter((k) => k !== s.cur));
     const log = [];
@@ -479,6 +569,7 @@
     };
     v.onerror = () => fail("Lecture impossible (" + (MEDIA_ERRORS[v.error && v.error.code] || "erreur inconnue") + ").");
     v.onplaying = v.oncanplay = () => { stat.textContent = ""; };
+    v.addEventListener("playing", () => { if (token === playToken) markSeen(); }, { once: true });
     v.onwaiting = () => { if (!v.paused) stat.textContent = "Mise en mémoire…"; };
     stat.textContent = "Chargement : " + (c.label || "flux") + "…";
 
@@ -528,7 +619,16 @@
     const list = el("div", { id: "srclist" });
     const adult = el("input", { type: "checkbox", id: "adult" });
     adult.checked = adultOn;
-    adult.onchange = () => { adultOn = adult.checked; store.set(ADULT, adultOn ? "1" : "0"); renderList(); };
+    adult.onchange = () => {
+      adultOn = adult.checked; store.set(ADULT, adultOn ? "1" : "0");
+      if (adultOn && !moreLoaded) { st.textContent = "Chargement…"; loadMore().then(() => { st.textContent = ""; renderList(); }, fail); }
+      renderList();
+    };
+    const more = el("button", { type: "button", onclick: () => {
+      st.textContent = "Chargement des autres langues…";
+      loadMore().then(() => { st.textContent = ""; more.hidden = true; renderList(); }, fail);
+    } }, "Afficher les autres langues (anglais, espagnol…)");
+    more.hidden = moreLoaded;
 
     const done = (r) => {
       const t = [];
@@ -580,7 +680,7 @@
         st.textContent = "Téléchargement…";
         addFromUrl(url.value).then((r) => { url.value = ""; done(r); }, fail);
       } }, url, el("button", { class: "ac", type: "submit" }, "Ajouter")),
-      el("div", { class: "row" }, el("button", { type: "button", onclick: () => file.click() }, "Depuis un fichier"), file),
+      el("div", { class: "row" }, el("button", { type: "button", onclick: () => file.click() }, "Depuis un fichier"), file, more),
       st,
       el("label", { class: "chk", for: "adult" }, adult, "Afficher les sources adultes (réservé aux personnes majeures, 18+)"),
       summary,
@@ -600,9 +700,12 @@
     const b = e.target.closest("[data-close]");
     if (b) b.closest("dialog").close();
   });
-  $("#player").addEventListener("close", () => { playToken++; stopVideo(); });
+  $("#player").addEventListener("close", () => { playToken++; stopVideo(); setCinema(false); paintEps(); });
   $("#pprev").addEventListener("click", () => session && session.index > 0 && playEpisode(session.index - 1));
   $("#pnext").addEventListener("click", () => session && session.index < session.entries[0].episodes.length - 1 && playEpisode(session.index + 1));
 
+  if (adultOn) loadMore().catch(() => {});
+  // Le lecteur HLS se charge en arrière-plan, sans bloquer l'affichage.
+  setTimeout(() => { loadHls(); }, 1500);
   show("search");
 })();
