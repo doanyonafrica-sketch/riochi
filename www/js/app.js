@@ -23,6 +23,24 @@
     Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error("délai dépassé")), ms))]);
   const hue = (s) => [...String(s)].reduce((a, c) => a + c.charCodeAt(0), 0) % 360;
 
+  // ---------------------------------------------------------------- journal réseau
+  // Garde les dernières requêtes refusées (403, 5xx…) pour les montrer quand aucun flux ne se lance.
+  const netLog = [];
+  if (typeof window.fetch === "function") {
+    const baseFetch = window.fetch.bind(window);
+    window.fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : (input && input.url) || String(input);
+      try {
+        const r = await baseFetch(input, init);
+        if (!r.ok && !/graphql\.anilist\.co|fonts\.g/.test(url)) { netLog.push(r.status + " " + url.slice(0, 90)); if (netLog.length > 8) netLog.shift(); }
+        return r;
+      } catch (e) {
+        if (!/graphql\.anilist\.co|fonts\.g/.test(url)) { netLog.push("réseau " + url.slice(0, 90)); if (netLog.length > 8) netLog.shift(); }
+        throw e;
+      }
+    };
+  }
+
   // ---------------------------------------------------------------- cache $store
   // Certains plugins gardent des pages en mémoire quelques minutes dans $store.
   const mem = new Map();
@@ -166,7 +184,7 @@
   }
 
   // ---------------------------------------------------------------- recherche
-  let lastQuery = "", lastDub = false, searchToken = 0;
+  let lastQuery = "", lastDub = false, searchToken = 0, lastRes = [];
 
   function viewSearch() {
     const main = $("#main");
@@ -252,6 +270,7 @@
         }
       }));
       if (token !== searchToken) return;
+      lastRes = res.filter((r) => r.items.length);
       const cards = res.flatMap(({ src, items }) => items.map((r) => card(src, r)));
       const errors = res.filter((r) => r.error).map((r) => el("p", { class: "mut" }, r.src.name + " : " + r.error));
       out.replaceChildren(
@@ -297,7 +316,9 @@
       const list = await withTimeout(providerOf(src).findEpisodes(r.id), 45000);
       if (!Array.isArray(list) || !list.length) throw new Error("aucun épisode");
       info.textContent = list.length + " épisode" + (list.length > 1 ? "s" : "");
-      session = { src, title, episodes: list, index: 0 };
+      // La source ouverte d'abord, puis les autres sources qui ont trouvé cet anime (changement possible dans le lecteur).
+      const alts = lastRes.filter((x) => x.src.id !== src.id).map((x) => ({ src: x.src, item: x.items[0], episodes: null }));
+      session = { title, index: 0, cur: 0, entries: [{ src, item: r, episodes: list }].concat(alts) };
       list.forEach((ep, i) =>
         eps.append(el("li", {}, el("button", { onclick: () => openPlayer(i) }, ep.title || "Épisode " + (ep.number ?? i + 1)))));
     } catch (e) {
@@ -310,8 +331,13 @@
 
   function ensurePlayerUi() {
     if ($("#pstat")) return;
-    $("#video").after(el("p", { class: "mut", id: "pstat", role: "status", style: "padding:8px 16px 0" }));
-    $("#player .bar [data-close]").before(el("select", { id: "psel", "aria-label": "Version", hidden: true }));
+    const psrc = el("select", { id: "psrc", "aria-label": "Source", hidden: true });
+    const psel = el("select", { id: "psel", "aria-label": "Version", hidden: true });
+    psrc.onchange = () => { session.cur = Number(psrc.value); playEpisode(session.index, true); };
+    $("#video").after(
+      el("div", { id: "pctl", style: "display:flex;gap:8px;flex-wrap:wrap;padding:8px 16px 0" }, psrc, psel),
+      el("p", { class: "mut", id: "pstat", role: "status", style: "padding:8px 16px 0" })
+    );
   }
 
   function stopVideo() {
@@ -330,21 +356,22 @@
     playEpisode(i);
   }
 
-  async function playEpisode(i) {
-    const s = session;
-    s.index = i;
-    const ep = s.episodes[i];
-    $("#ptitle").textContent = s.title + " · " + (ep.title || "Épisode " + (ep.number ?? i + 1));
-    $("#pprev").disabled = i <= 0;
-    $("#pnext").disabled = i >= s.episodes.length - 1;
-    const stat = $("#pstat"), sel = $("#psel");
-    const token = ++playToken;
-    stopVideo();
-    sel.hidden = true;
-    sel.replaceChildren();
-    stat.textContent = "Recherche du flux…";
+  // Les épisodes d'une autre source : chargés à la demande, retrouvés par leur numéro.
+  async function episodeFor(entry, i) {
+    const base = session.entries[0].episodes[i];
+    if (entry === session.entries[0]) return base;
+    if (!entry.episodes) {
+      try { entry.episodes = await withTimeout(providerOf(entry.src).findEpisodes(entry.item.id), 45000); }
+      catch (e) { entry.episodes = []; entry.error = msg(e); }
+    }
+    const n = base.number;
+    return entry.episodes.find((e) => n != null && e.number === n)
+      || (entry.episodes.length === session.entries[0].episodes.length ? entry.episodes[i] : null) || null;
+  }
 
-    const prov = providerOf(s.src);
+  // Tous les flux qu'une source donne pour un épisode (un appel par serveur du plugin).
+  async function collectChoices(entry, ep) {
+    const prov = providerOf(entry.src);
     const settings = (prov.getSettings && prov.getSettings()) || {};
     const servers = settings.episodeServers && settings.episodeServers.length ? settings.episodeServers : ["default"];
     const errors = [];
@@ -352,21 +379,61 @@
       try { return await withTimeout(prov.findEpisodeServer(ep, sv), 60000); }
       catch (e) { errors.push(sv + " : " + msg(e)); return null; }
     }));
-    if (token !== playToken) return;
-
     const choices = [];
     for (const r of results) {
       if (!r || !Array.isArray(r.videoSources)) continue;
       for (const v of r.videoSources) {
-        if (v && v.url) choices.push({ url: v.url, type: v.type, headers: r.headers || {}, subtitles: v.subtitles || [], label: [r.server || v.label, v.quality].filter(Boolean).join(" · ") });
+        if (v && v.url) choices.push({ url: v.url, type: v.type, headers: r.headers || {}, subtitles: v.subtitles || [], label: [entry.src.name, r.server || v.label, v.quality].filter(Boolean).join(" · ") });
       }
     }
-    if (!choices.length) { stat.textContent = "Aucun flux disponible. " + errors.join(" ; ") + (errors.some((e) => /unreachable/.test(e)) ? " Dans un navigateur, les sites d'anime bloquent ces appels (CORS) : ça ne marchera que dans l'application Android." : ""); return; }
+    return { choices, errors };
+  }
 
-    choices.forEach((c, k) => sel.append(el("option", { value: k }, c.label || "Flux " + (k + 1))));
-    sel.hidden = choices.length < 2;
-    sel.onchange = () => play(choices, Number(sel.value), token);
-    play(choices, 0, token);
+  // explicit = l'utilisateur a choisi une source : on ne bascule pas ailleurs sans le lui dire.
+  async function playEpisode(i, explicit) {
+    const s = session;
+    s.index = i;
+    const base = s.entries[0].episodes[i];
+    $("#ptitle").textContent = s.title + " · " + (base.title || "Épisode " + (base.number ?? i + 1));
+    $("#pprev").disabled = i <= 0;
+    $("#pnext").disabled = i >= s.entries[0].episodes.length - 1;
+    const stat = $("#pstat"), sel = $("#psel"), psrc = $("#psrc");
+    const token = ++playToken;
+    stopVideo();
+    sel.hidden = true;
+    sel.replaceChildren();
+    psrc.replaceChildren(...s.entries.map((e, k) => el("option", { value: k }, e.src.name)));
+    psrc.value = String(s.cur);
+    psrc.hidden = s.entries.length < 2;
+    netLog.length = 0;
+
+    const order = explicit ? [s.cur] : [s.cur].concat(s.entries.map((_, k) => k).filter((k) => k !== s.cur));
+    const log = [];
+    const next = async (pos) => {
+      if (token !== playToken) return;
+      if (pos >= order.length) {
+        const net = netLog.length ? " Requêtes refusées : " + netLog.join(" ; ") + "." : "";
+        const hint = s.entries.length < 2 ? " Aucune autre source n'a trouvé cet anime : active d'autres sources dans l'onglet Sources puis relance la recherche." : "";
+        stat.textContent = "Aucun flux disponible. " + log.join(" | ") + net + hint;
+        return;
+      }
+      const k = order[pos], entry = s.entries[k];
+      stat.textContent = (pos ? "Source suivante : " : "Recherche du flux : ") + entry.src.name + "…";
+      const ep = await episodeFor(entry, i);
+      if (token !== playToken) return;
+      if (!ep) { log.push(entry.src.name + " : épisode " + (base.number ?? i + 1) + " introuvable" + (entry.error ? " (" + entry.error + ")" : "")); return next(pos + 1); }
+      const { choices, errors } = await collectChoices(entry, ep);
+      if (token !== playToken) return;
+      if (!choices.length) { log.push(entry.src.name + " → " + errors.join(" ; ")); return next(pos + 1); }
+      s.cur = k;
+      psrc.value = String(k);
+      choices.forEach((c, n) => sel.append(el("option", { value: n }, c.label || "Flux " + (n + 1))));
+      sel.hidden = choices.length < 2;
+      const dead = (why) => { log.push(entry.src.name + " → " + why); next(pos + 1); };
+      sel.onchange = () => play(choices, Number(sel.value), token, dead);
+      play(choices, 0, token, dead);
+    };
+    next(0);
   }
 
   // hls.js lit les flux .m3u8 ; s'il n'est pas déjà chargé, on le demande à trois CDN à la suite.
@@ -399,14 +466,15 @@
   const MEDIA_ERRORS = { 1: "annulée", 2: "erreur réseau", 3: "décodage impossible", 4: "lien ou format non pris en charge" };
 
   // Lance le flux choices[k] ; en cas d'échec, essaie le suivant et dit ce qui s'est passé.
-  async function play(choices, k, token) {
+  async function play(choices, k, token, onDead) {
     if (token !== playToken) return;
     const c = choices[k], v = $("#video"), stat = $("#pstat");
     stopVideo();
     $("#psel").value = String(k);
     const fail = (why) => {
       if (token !== playToken) return;
-      if (k + 1 < choices.length) { stat.textContent = why + " Essai du flux suivant…"; play(choices, k + 1, token); }
+      if (k + 1 < choices.length) { stat.textContent = why + " Essai du flux suivant…"; play(choices, k + 1, token, onDead); }
+      else if (onDead) onDead(why);
       else stat.textContent = why + " Aucun autre flux à essayer.";
     };
     v.onerror = () => fail("Lecture impossible (" + (MEDIA_ERRORS[v.error && v.error.code] || "erreur inconnue") + ").");
@@ -534,7 +602,7 @@
   });
   $("#player").addEventListener("close", () => { playToken++; stopVideo(); });
   $("#pprev").addEventListener("click", () => session && session.index > 0 && playEpisode(session.index - 1));
-  $("#pnext").addEventListener("click", () => session && session.index < session.episodes.length - 1 && playEpisode(session.index + 1));
+  $("#pnext").addEventListener("click", () => session && session.index < session.entries[0].episodes.length - 1 && playEpisode(session.index + 1));
 
   show("search");
 })();
