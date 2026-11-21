@@ -229,10 +229,11 @@
   }
 
   // ---------------------------------------------------------------- navigation
-  const tabs = [["search", "Recherche"], ["sources", "Sources"]];
+  const tabs = [["search", "Accueil"], ["sources", "Sources"]];
   function show(name) {
+    if (name !== "search") { $("#hsearch").replaceChildren(); watchHandler = null; }
     $("#nav").replaceChildren(
-      ...tabs.map(([k, label]) => el("button", { "aria-current": k === name ? "page" : false, onclick: () => show(k) }, label))
+      ...tabs.map(([k, label]) => el("button", { "aria-current": k === name ? "page" : false, onclick: () => { if (k === "search" && name === "search") lastQuery = ""; show(k); } }, label))
     );
     (name === "search" ? viewSearch : viewSources)();
   }
@@ -240,7 +241,7 @@
   // ---------------------------------------------------------------- titres AniList
   // AniList (base publique d'anime, sans clé) fournit l'accueil et les suggestions.
   // Le titre choisi est transmis aux plugins (media) pour mieux retrouver l'anime.
-  const MEDIA = "id idMal title{romaji english} synonyms format episodes seasonYear startDate{year month day} coverImage{large}";
+  const MEDIA = "id idMal title{romaji english} synonyms format episodes seasonYear startDate{year month day} coverImage{extraLarge large} bannerImage description(asHtml:false) genres averageScore";
   async function anilist(query, variables) {
     const r = await withTimeout(fetch("https://graphql.anilist.co", {
       method: "POST",
@@ -258,12 +259,16 @@
     synonyms: m.synonyms || [], format: m.format, episodeCount: m.episodes,
     startDate: m.startDate, year: m.seasonYear || (m.startDate && m.startDate.year) || null,
   });
+  const plain = (t) => String(t || "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  const slim = (m) => ({ id: m.id, idMal: m.idMal, title: m.title, synonyms: m.synonyms, format: m.format, episodes: m.episodes, seasonYear: m.seasonYear, startDate: m.startDate, coverImage: m.coverImage, bannerImage: m.bannerImage, genres: m.genres, averageScore: m.averageScore });
+  const CONT = "riochi.continue";
+  let lastMedia = null, watchHandler = null;
   const metaOf = (m) => [m.seasonYear || (m.startDate && m.startDate.year), m.format && m.format.replace(/_/g, " ")].filter(Boolean).join(" · ");
 
   let homeData = null;
   function loadHome() {
     if (homeData) return Promise.resolve(homeData);
-    const cached = readJson("riochi.home2", null);
+    const cached = readJson("riochi.home3", null);
     const fresh = cached && cached.data && Date.now() - cached.at < 6 * 3600 * 1000;
     const now = new Date();
     const season = ["WINTER", "SPRING", "SUMMER", "FALL"][Math.floor(now.getMonth() / 3)];
@@ -273,7 +278,7 @@
       films:Page(perPage:12){media(type:ANIME,format:MOVIE,sort:POPULARITY_DESC,isAdult:false){${MEDIA}}}
       top:Page(perPage:12){media(type:ANIME,sort:SCORE_DESC,isAdult:false){${MEDIA}}}}`;
     const fetchIt = () => anilist(q, { season, year: now.getFullYear() }).then((d) => {
-      store.set("riochi.home2", JSON.stringify({ at: Date.now(), data: d }));
+      store.set("riochi.home3", JSON.stringify({ at: Date.now(), data: d }));
       return d;
     });
     if (cached && cached.data) {
@@ -289,28 +294,28 @@
 
   function viewSearch() {
     const main = $("#main");
-    const input = el("input", { type: "search", id: "q", placeholder: "Titre d'un anime ou d'un film", autocomplete: "off", "aria-label": "Titre" });
+    const input = el("input", { type: "search", id: "q", placeholder: "Titres, films…", autocomplete: "off", "aria-label": "Titre" });
     input.value = lastQuery;
     const dub = el("input", { type: "checkbox", id: "dub" });
     const kind = el("select", { id: "kind", "aria-label": "Type" },
-      el("option", { value: "" }, "Tout (séries, films…)"), el("option", { value: "TV" }, "Séries"),
+      el("option", { value: "" }, "Tout"), el("option", { value: "TV" }, "Séries"),
       el("option", { value: "MOVIE" }, "Films"), el("option", { value: "OVA" }, "OAV et spéciaux"));
     const fmtOf = () => ({ TV: "format_in:[TV,TV_SHORT,ONA],", MOVIE: "format_in:[MOVIE],", OVA: "format_in:[OVA,SPECIAL]," })[kind.value] || "";
     dub.checked = lastDub;
     const sugg = el("div", { class: "sugg", hidden: true });
     const out = el("div", { id: "out" });
     let media = null, suggToken = 0, timer = 0;
-    main.replaceChildren(
-      el("form", { onsubmit: (e) => { e.preventDefault(); sugg.hidden = true; run(); } },
+    $("#hsearch").replaceChildren(
+      el("form", { class: "hs", onsubmit: (e) => { e.preventDefault(); sugg.hidden = true; run(); } },
         el("div", { class: "sw" }, input, sugg),
-        el("div", { class: "row" }, kind),
-        el("label", { class: "chk", for: "dub" }, dub, "Version doublée (VF)")),
-      out
-    );
+        el("div", { class: "hfilters" }, kind, el("label", { class: "chk", for: "dub" }, dub, "VF"))));
+    main.replaceChildren(out);
+    watchHandler = (m) => watch(m);
 
     // Suggestions pendant la frappe.
     input.addEventListener("input", () => {
-      media = null;
+      media = null; lastMedia = null;
+      $("header").classList.toggle("q", input.value.trim().length > 0);
       clearTimeout(timer);
       const q = input.value.trim();
       if (q.length < 2) { sugg.hidden = true; if (!q) { lastQuery = ""; showHome(); } return; }
@@ -329,42 +334,62 @@
     kind.onchange = () => { if (input.value.trim().length >= 2) input.dispatchEvent(new Event("input")); else showHome(); };
     input.addEventListener("blur", () => setTimeout(() => { sugg.hidden = true; }, 200));
 
-    function pick(m) {
+    function pick(m) { sugg.hidden = true; openInfo(m); }
+    // « Regarder » : cherche l'anime dans les sources et ouvre la première qui répond.
+    function watch(m) {
       input.value = titleOf(m);
-      media = toMedia(m);
+      media = toMedia(m); lastMedia = m;
       sugg.hidden = true;
-      run();
+      run(true);
     }
 
     async function showHome() {
       const token = ++searchToken;
-      out.replaceChildren(el("p", { class: "empty" }, "Chargement des titres…"));
+      out.replaceChildren(el("div", { class: "skel hero-s" }), el("div", { class: "skel row-s" }));
       try {
+        const cardOf = (m) => el("button", { class: "card", onclick: () => pick(m) },
+          poster(titleOf(m), m.coverImage && m.coverImage.large), el("b", {}, titleOf(m)));
         if (kind.value) {
           const f = await anilist(`query{Page(perPage:30){media(type:ANIME,${fmtOf()}sort:POPULARITY_DESC,isAdult:false){${MEDIA}}}}`);
           if (token !== searchToken) return;
-          out.replaceChildren(el("div", { class: "grid", style: "margin-top:20px" }, f.Page.media.map((m) =>
-            el("button", { class: "card", onclick: () => pick(m) }, poster(titleOf(m), m.coverImage && m.coverImage.large), el("b", {}, titleOf(m)), el("small", {}, metaOf(m))))));
+          out.replaceChildren(el("div", { class: "grid" }, f.Page.media.map(cardOf)));
           return;
         }
         const d = await loadHome();
         if (token !== searchToken) return;
-        const shelf = (title, list) => [
-          el("h2", {}, title),
-          el("div", { class: "shelf" }, list.map((m) =>
-            el("button", { class: "card", onclick: () => pick(m) },
-              poster(titleOf(m), m.coverImage && m.coverImage.large), el("b", {}, titleOf(m)), el("small", {}, metaOf(m))))),
-        ];
-        out.replaceChildren(...shelf("Tendances", d.trending.media), ...shelf("Populaires cette saison", d.season.media), ...(d.films ? shelf("Films", d.films.media) : []), ...shelf("Les mieux notés", d.top.media));
+        const shelf = (title, list) => list && list.length ? [el("h2", {}, title), el("div", { class: "shelf" }, list.map(cardOf))] : [];
+        const cont = readJson(CONT, []).filter((x) => x && x.media);
+        const contRow = cont.length ? [el("h2", {}, "Continuer à regarder"), el("div", { class: "shelf" }, cont.map((x) => {
+          const m = x.media, total = x.total || m.episodes || x.index + 1;
+          return el("button", { class: "card", onclick: () => watch(m) },
+            poster(titleOf(m), m.coverImage && m.coverImage.large), el("b", {}, titleOf(m)),
+            el("small", {}, "Épisode " + (x.number || x.index + 1)),
+            el("div", { class: "prog" }, el("i", { style: "width:" + Math.min(100, Math.round(((x.index + 1) / total) * 100)) + "%" })));
+        }))] : [];
+        const cands = d.trending.media.filter((m) => m.bannerImage && m.description);
+        const hm = cands.length ? cands[Math.floor(Math.random() * cands.length)] : d.trending.media[0];
+        const cover = hm && hm.coverImage && (hm.coverImage.extraLarge || hm.coverImage.large);
+        const hero = hm ? el("section", { class: "hero" },
+          hm.bannerImage || cover ? el("img", { class: "h-wide", src: hm.bannerImage || cover, alt: "", referrerpolicy: "no-referrer", onerror: (e) => e.target.remove() }) : null,
+          cover ? el("img", { class: "h-tall", src: cover, alt: "", referrerpolicy: "no-referrer", onerror: (e) => e.target.remove() }) : null,
+          el("div", { class: "hero-in" },
+            el("h1", {}, titleOf(hm)),
+            el("p", { class: "hmeta" }, [hm.averageScore ? "★ " + hm.averageScore + " %" : "", metaOf(hm)].filter(Boolean).join("  ·  ")),
+            el("p", { class: "hsyn" }, plain(hm.description)),
+            el("div", { class: "acts" },
+              el("button", { class: "play", onclick: () => watch(hm) }, "▶ Regarder"),
+              el("button", { class: "more", onclick: () => openInfo(hm) }, "ⓘ Plus d'infos")))) : el("div", { style: "height:24px" });
+        out.replaceChildren(hero, ...contRow, ...shelf("Tendances actuelles", d.trending.media), ...shelf("Populaires cette saison", d.season.media),
+          ...shelf("Films", d.films && d.films.media), ...shelf("Les mieux notés", d.top.media));
       } catch (e) {
         if (token !== searchToken) return;
         out.replaceChildren(
-          el("p", { class: "empty" }, "Les titres suggérés sont indisponibles (" + msg(e) + "). Tu peux quand même chercher un titre ci-dessus."),
+          el("p", { class: "empty" }, "Les titres suggérés sont indisponibles (" + msg(e) + "). Tu peux quand même chercher un titre en haut."),
           el("button", { onclick: showHome }, "Réessayer"));
       }
     }
 
-    async function run() {
+    async function run(autoOpen) {
       const q = input.value.trim();
       if (!q) { showHome(); return; }
       lastQuery = q; lastDub = dub.checked;
@@ -378,6 +403,7 @@
       const srcs = active();
       const results = new Array(srcs.length).fill(null);
       let pending = srcs.length;
+      let opened = false;
       const paint = () => {
         if (token !== searchToken) return;
         const done = results.filter(Boolean);
@@ -424,6 +450,11 @@
         results[n] = r;
         pending--;
         paint();
+        if (autoOpen === true && !opened && token === searchToken && r.items.length) {
+          opened = true;
+          const it = r.items[0];
+          openDetail(src, it, asked.englishTitle || asked.romajiTitle || it.title || it.name || q);
+        }
       }));
       if (token === searchToken && !lastRes.length) logErr("recherche", q + " : aucun résultat (" + srcs.map((x) => x.name).join(", ") + ")");
     }
@@ -457,37 +488,68 @@
     const d = readSeen();
     d.eps[session.index] = 1; d.last = session.index;
     store.set(seenKey(), JSON.stringify(d));
+    if (session.media) {
+      const ep = session.entries[0].episodes[session.index];
+      const list = readJson(CONT, []).filter((x) => x && x.media && x.media.id !== session.media.id);
+      list.unshift({ media: slim(session.media), index: session.index, number: ep && ep.number, total: session.entries[0].episodes.length, at: Date.now() });
+      store.set(CONT, JSON.stringify(list.slice(0, 12)));
+    }
     paintEps();
+  }
+
+  // Fiche d'un titre (bannière, note, synopsis) avec le bouton « Regarder ».
+  function openInfo(m) {
+    const d = $("#info");
+    const art = m.bannerImage || (m.coverImage && (m.coverImage.extraLarge || m.coverImage.large));
+    d.replaceChildren(
+      el("div", { class: "dhero" },
+        art ? el("img", { class: "dbg", src: art, alt: "", referrerpolicy: "no-referrer", onerror: (e) => e.target.remove() }) : null,
+        el("button", { class: "x", "data-close": true, "aria-label": "Fermer" }, "✕"),
+        el("div", { class: "dh-t" }, el("h2", {}, titleOf(m)),
+          el("div", { class: "acts" }, el("button", { class: "play", onclick: () => { d.close(); if (watchHandler) watchHandler(m); } }, "▶ Regarder")))),
+      el("div", { class: "dbody2" },
+        el("p", { class: "meta" }, [m.averageScore ? "★ " + m.averageScore + " %" : "", metaOf(m), m.episodes ? m.episodes + " épisode" + (m.episodes > 1 ? "s" : "") : ""].filter(Boolean).join("  ·  ")),
+        m.genres && m.genres.length ? el("p", { class: "mut" }, m.genres.slice(0, 4).join(" · ")) : null,
+        el("p", { class: "syn" }, plain(m.description) || "Pas de synopsis.")));
+    d.showModal();
   }
 
   async function openDetail(src, r, title) {
     const d = $("#detail");
+    const m = lastMedia;
+    const art = (m && (m.bannerImage || (m.coverImage && (m.coverImage.extraLarge || m.coverImage.large)))) || r.image || r.cover || r.poster || null;
     const info = el("p", { class: "mut" }, "Chargement des épisodes…");
+    const acts = el("div", { class: "acts" });
     const eps = el("ul", { class: "eps" });
     d.replaceChildren(
-      el("div", { class: "bar" }, el("h2", {}, title), el("button", { "data-close": true }, "Fermer")),
-      el("div", { class: "dbody" },
-        poster(title, r.image || r.cover || r.poster),
-        el("div", {}, el("p", { class: "mut" }, src.name), r.description ? el("p", {}, r.description) : null, info)),
-      eps
+      el("div", { class: "dhero" },
+        art ? el("img", { class: "dbg", src: art, alt: "", referrerpolicy: "no-referrer", onerror: (e) => e.target.remove() }) : null,
+        el("button", { class: "x", "data-close": true, "aria-label": "Fermer" }, "✕"),
+        el("div", { class: "dh-t" }, el("h2", {}, title), acts)),
+      el("div", { class: "dbody2" },
+        el("p", { class: "mut" }, src.name),
+        m && m.description ? el("p", { class: "syn" }, plain(m.description)) : r.description ? el("p", { class: "syn" }, r.description) : null,
+        info, eps)
     );
-    d.showModal();
+    if (!d.open) d.showModal();
     try {
       const list = await withTimeout(providerOf(src).findEpisodes(r.id), 45000);
       if (!Array.isArray(list) || !list.length) throw new Error("aucun épisode");
       info.textContent = list.length + " épisode" + (list.length > 1 ? "s" : "");
       // La source ouverte d'abord, puis les autres sources qui ont trouvé cet anime (changement possible dans le lecteur).
       const alts = lastRes.filter((x) => x.src.id !== src.id).map((x) => ({ src: x.src, item: x.items[0], episodes: null }));
-      session = { title, index: 0, cur: 0, entries: [{ src, item: r, episodes: list }].concat(alts) };
+      session = { title, index: 0, cur: 0, media: m, q: lastQuery, entries: [{ src, item: r, episodes: list }].concat(alts) };
       session.chips = [];
       list.forEach((ep, i) => {
-        const chip = el("button", { title: ep.title || "", onclick: () => openPlayer(i) }, String(ep.number ?? i + 1));
+        const num = ep.number ?? i + 1;
+        const chip = el("button", { onclick: () => openPlayer(i) }, el("span", { class: "n" }, String(num)), el("span", { class: "t" }, ep.title || "Épisode " + num));
         session.chips.push(chip);
         eps.append(el("li", {}, chip));
       });
       const seen = readSeen();
-      if (seen.last >= 0 && seen.last < list.length)
-        eps.before(el("button", { class: "ac resume", onclick: () => openPlayer(seen.last) }, "Reprendre · épisode " + (list[seen.last].number ?? seen.last + 1)));
+      const go = seen.last >= 0 && seen.last < list.length ? seen.last : 0;
+      acts.append(el("button", { class: "play", onclick: () => openPlayer(go) },
+        seen.last >= 0 ? "▶ Reprendre · épisode " + (list[go].number ?? go + 1) : "▶ Lecture"));
       paintEps();
     } catch (e) {
       info.textContent = "Épisodes introuvables : " + msg(e);
@@ -609,6 +671,7 @@
   async function playEpisode(i, explicit) {
     const s = session;
     s.index = i;
+    if (s.q === lastQuery) lastRes.forEach((x) => { if (!s.entries.some((e) => e.src.id === x.src.id)) s.entries.push({ src: x.src, item: x.items[0], episodes: null }); });
     const base = s.entries[0].episodes[i];
     $("#ptitle").textContent = s.title + " · " + (base.title || "Épisode " + (base.number ?? i + 1));
     $("#pprev").disabled = i <= 0;
@@ -878,6 +941,8 @@
     const b = e.target.closest("[data-close]");
     if (b) b.closest("dialog").close();
   });
+  for (const id of ["#info", "#detail"]) $(id).addEventListener("click", (e) => { if (e.target === e.currentTarget) e.currentTarget.close(); });
+  window.addEventListener("scroll", () => $("header").classList.toggle("solid", window.scrollY > 24), { passive: true });
   $("#player").addEventListener("close", () => { playToken++; stopVideo(); setCinema(false); paintEps(); });
   $("#pprev").addEventListener("click", () => session && session.index > 0 && playEpisode(session.index - 1));
   $("#pnext").addEventListener("click", () => session && session.index < session.entries[0].episodes.length - 1 && playEpisode(session.index + 1));
