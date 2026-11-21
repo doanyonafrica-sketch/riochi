@@ -262,7 +262,7 @@
   const plain = (t) => String(t || "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
   const slim = (m) => ({ id: m.id, idMal: m.idMal, title: m.title, synonyms: m.synonyms, format: m.format, episodes: m.episodes, seasonYear: m.seasonYear, startDate: m.startDate, coverImage: m.coverImage, bannerImage: m.bannerImage, genres: m.genres, averageScore: m.averageScore });
   const CONT = "riochi.continue";
-  let lastMedia = null, watchHandler = null;
+  let lastMedia = null, watchHandler = null, pendingEp = null;
   const metaOf = (m) => [m.seasonYear || (m.startDate && m.startDate.year), m.format && m.format.replace(/_/g, " ")].filter(Boolean).join(" · ");
 
   let homeData = null;
@@ -310,7 +310,7 @@
         el("div", { class: "sw" }, input, sugg),
         el("div", { class: "hfilters" }, kind, el("label", { class: "chk", for: "dub" }, dub, "VF"))));
     main.replaceChildren(out);
-    watchHandler = (m) => watch(m);
+    watchHandler = (m, o) => watch(m, o);
 
     // Suggestions pendant la frappe.
     input.addEventListener("input", () => {
@@ -336,11 +336,12 @@
 
     function pick(m) { sugg.hidden = true; openInfo(m); }
     // « Regarder » : cherche l'anime dans les sources et ouvre la première qui répond.
-    function watch(m) {
+    function watch(m, o) {
+      if (o && typeof o.dub === "boolean") { dub.checked = o.dub; pendingEp = o.ep ?? null; }
       input.value = titleOf(m);
       media = toMedia(m); lastMedia = m;
       sugg.hidden = true;
-      run(true);
+      return run(true);
     }
 
     async function showHome() {
@@ -457,6 +458,7 @@
         }
       }));
       if (token === searchToken && !lastRes.length) logErr("recherche", q + " : aucun résultat (" + srcs.map((x) => x.name).join(", ") + ")");
+      return opened;
     }
 
     if (lastQuery) run(); else showHome();
@@ -497,6 +499,31 @@
     paintEps();
   }
 
+  // Choix de la langue comme sur Netflix : VOSTFR (version originale sous-titrée) ou VF (doublé en français).
+  function langSwitch() {
+    const box = $("#dub");
+    const btn = (label, isDub) => {
+      const b = el("button", { type: "button", "aria-pressed": String(Boolean(box && box.checked) === isDub) }, label);
+      b.onclick = () => {
+        if (box) box.checked = isDub;
+        b.parentNode.querySelectorAll("button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+      };
+      return b;
+    };
+    return el("div", { class: "seg", role: "group", "aria-label": "Langue" }, btn("VOSTFR", false), btn("VF", true));
+  }
+
+  // Dans le lecteur : on bascule VOSTFR ↔ VF en gardant le même épisode.
+  async function switchLang() {
+    const stat = $("#pstat");
+    if (!session || !session.media || !watchHandler) { stat.textContent = "Change la langue depuis une fiche (accueil ou recherche) : ce titre n'a pas de fiche liée."; return; }
+    const next = !lastDub, name = next ? "VF" : "VOSTFR";
+    stat.textContent = "Recherche de la version " + name + "…";
+    let ok = false;
+    try { ok = await watchHandler(session.media, { dub: next, ep: session.index }); } catch (e) { logErr("langue", msg(e)); }
+    if (!ok) { pendingEp = null; stat.textContent = "Version " + name + " introuvable dans tes sources."; }
+  }
+
   // Fiche d'un titre (bannière, note, synopsis) avec le bouton « Regarder ».
   function openInfo(m) {
     const d = $("#info");
@@ -506,7 +533,9 @@
         art ? el("img", { class: "dbg", src: art, alt: "", referrerpolicy: "no-referrer", onerror: (e) => e.target.remove() }) : null,
         el("button", { class: "x", "data-close": true, "aria-label": "Fermer" }, "✕"),
         el("div", { class: "dh-t" }, el("h2", {}, titleOf(m)),
-          el("div", { class: "acts" }, el("button", { class: "play", onclick: () => { d.close(); if (watchHandler) watchHandler(m); } }, "▶ Regarder")))),
+          el("div", { class: "acts" },
+            el("button", { class: "play", onclick: () => { d.close(); if (watchHandler) watchHandler(m); } }, "▶ Regarder"),
+            langSwitch()))),
       el("div", { class: "dbody2" },
         el("p", { class: "meta" }, [m.averageScore ? "★ " + m.averageScore + " %" : "", metaOf(m), m.episodes ? m.episodes + " épisode" + (m.episodes > 1 ? "s" : "") : ""].filter(Boolean).join("  ·  ")),
         m.genres && m.genres.length ? el("p", { class: "mut" }, m.genres.slice(0, 4).join(" · ")) : null,
@@ -551,7 +580,9 @@
       acts.append(el("button", { class: "play", onclick: () => openPlayer(go) },
         seen.last >= 0 ? "▶ Reprendre · épisode " + (list[go].number ?? go + 1) : "▶ Lecture"));
       paintEps();
+      if (pendingEp !== null) { const i = Math.min(pendingEp, list.length - 1); pendingEp = null; openPlayer(i); }
     } catch (e) {
+      pendingEp = null;
       info.textContent = "Épisodes introuvables : " + msg(e);
     }
   }
@@ -569,6 +600,7 @@
       el("div", { id: "pctl" },
         el("button", { type: "button", id: "pskip", class: "ac", hidden: true }, "Passer"),
         psrc, psel,
+        el("button", { type: "button", id: "plang", title: "Changer de langue (VOSTFR / VF)", onclick: switchLang }, "🌐"),
         el("button", { type: "button", "aria-label": "Reculer de 10 secondes", onclick: () => seek(-10) }, "⟲ 10 s"),
         el("button", { type: "button", "aria-label": "Avancer de 10 secondes", onclick: () => seek(10) }, "10 s ⟳"),
         el("button", { type: "button", "aria-label": "Avancer de 85 secondes (passer l'opening)", onclick: () => seek(85) }, "⏭ 85 s"),
@@ -681,6 +713,8 @@
     stopVideo();
     sel.hidden = true;
     sel.replaceChildren();
+    const langBtn = $("#plang");
+    if (langBtn) langBtn.textContent = "🌐 " + (lastDub ? "VF" : "VOSTFR") + " ⇄";
     const skipBtn = $("#pskip");
     if (skipBtn) skipBtn.hidden = true;
     psrc.replaceChildren(...s.entries.map((e, k) => el("option", { value: k }, e.src.name)));
