@@ -112,3 +112,11 @@ input[type=search]{margin-top:16px;font-size:16px;min-height:48px;border-radius:
  #pstat{position:fixed;left:0;right:0;bottom:64px;text-align:center;background:rgba(0,0,0,.65);padding:6px 12px;z-index:9;color:#fff}
  nav{display:none}
 }
+
+#pskip{font-weight:700}
+#player.cinema #pskip,#pskip.over{position:fixed;right:14px;bottom:78px;z-index:10}
+#player.cinema #pctl button,#player.cinema #pctl select{min-height:36px;padding:4px 10px;font-size:13px}
+@media(orientation:landscape) and (max-height:520px){
+ #pskip{position:fixed;right:14px;bottom:78px;z-index:10}
+ #pctl button,#pctl select{min-height:36px;padding:4px 10px;font-size:13px}
+}

@@ -1,6 +1,6 @@
 "use strict";
 // Riochi pour Windows : une fenêtre Electron qui affiche le dossier www/ (le même que dans l'APK).
-const { app, BrowserWindow, ipcMain, protocol, shell } = require("electron");
+const { app, BrowserWindow, ipcMain, protocol, shell, session, Notification } = require("electron");
 const fs = require("node:fs");
 const path = require("node:path");
 const bridge = require("./http-bridge");
@@ -86,6 +86,31 @@ app.whenReady().then(() => {
     return bridge.request(req);
   });
   ipcMain.on("riochi:abort", (event, id) => { if (trusted(event)) bridge.abort(id); });
+
+  // Téléchargement d'un épisode (fichier direct) dans Téléchargements/Riochi.
+  const pendingDl = new Map();
+  session.defaultSession.on("will-download", (e, item) => {
+    const target = pendingDl.get(item.getURLChain()[0]);
+    if (!target) return;
+    pendingDl.delete(item.getURLChain()[0]);
+    item.setSavePath(target);
+    item.once("done", (ev, state) => {
+      try { new Notification({ title: "Riochi", body: (state === "completed" ? "Téléchargement terminé : " : "Téléchargement interrompu : ") + path.basename(target) }).show(); } catch (err) { /* notification indisponible */ }
+    });
+  });
+  ipcMain.handle("riochi:download", (event, req) => {
+    if (!trusted(event)) throw new Error("Origine non autorisée");
+    const url = String((req && req.url) || "");
+    if (!/^https?:\/\//i.test(url)) return { ok: false, error: "adresse invalide" };
+    const name = String((req && req.name) || "episode.mp4").replace(/[\\/:*?"<>|]+/g, " ").trim() || "episode.mp4";
+    const dir = path.join(app.getPath("downloads"), "Riochi");
+    try { fs.mkdirSync(dir, { recursive: true }); } catch (err) { return { ok: false, error: "dossier inaccessible" }; }
+    const headers = {};
+    for (const [k, v] of Object.entries((req && req.headers) || {})) if (typeof v === "string") headers[k] = v;
+    pendingDl.set(url, path.join(dir, name));
+    try { event.sender.downloadURL(url, { headers }); } catch (err) { pendingDl.delete(url); return { ok: false, error: String(err && err.message) }; }
+    return { ok: true, where: dir };
+  });
 
   createWindow();
   app.on("activate", () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });

@@ -5,4 +5,5 @@ const { contextBridge, ipcRenderer } = require("electron");
 contextBridge.exposeInMainWorld("__riochiNative", {
   request: (req) => ipcRenderer.invoke("riochi:http", req),
   abort: (id) => ipcRenderer.send("riochi:abort", id),
+  download: (req) => ipcRenderer.invoke("riochi:download", req),
 });

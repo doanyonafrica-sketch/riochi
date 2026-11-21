@@ -25,6 +25,8 @@
 
   // ---------------------------------------------------------------- journal réseau
   // Garde les dernières requêtes refusées (403, 5xx…) pour les montrer quand aucun flux ne se lance.
+  const errLog = [];
+  const logErr = (where, text) => { errLog.push(new Date().toLocaleTimeString() + " · " + where + " · " + text); if (errLog.length > 40) errLog.shift(); };
   const netLog = [];
   if (typeof window.fetch === "function") {
     const baseFetch = window.fetch.bind(window);
@@ -61,12 +63,27 @@
   };
   const readJson = (k, d) => { try { const v = JSON.parse(store.get(k)); return v == null ? d : v; } catch (e) { return d; } };
   const tag = (list, group, extra) => (list || []).map((p) => Object.assign({}, p, { group }, extra || {}));
+  // Versions plus récentes des sources intégrées, téléchargées depuis les listes publiques de Weebox.
+  const UPD = "riochi.updates", UPD_AT = "riochi.updcheck", UPD_AUTO = "riochi.autoupd", UPD_LOG = "riochi.updlog";
+  let updates = readJson(UPD, {});
+  const vkey = (v) => String(v || "0").split(/[.\-+]/).map((x) => parseInt(x, 10) || 0);
+  const isNewer = (a, b) => {
+    const x = vkey(a), y = vkey(b);
+    for (let i = 0; i < Math.max(x.length, y.length); i++) { const d = (x[i] || 0) - (y[i] || 0); if (d) return d > 0; }
+    return false;
+  };
+  const withUpdate = (s) => {
+    const u = updates[s.id];
+    return u && isNewer(u.version, s.version)
+      ? Object.assign({}, s, { version: u.version, payload: u.payload, description: u.description || s.description, languages: u.languages || s.languages })
+      : s;
+  };
   const buildBuiltin = () => [].concat(
     tag(window.RIOCHI_DEFAULTS, "fr-base"),
     tag(window.RIOCHI_ANIX, "anix"),
     tag(window.RIOCHI_ADULT, "adult", { adult: true }),
     window.RIOCHI_DEMO ? tag([window.RIOCHI_DEMO], "demo") : []
-  ).filter((s, i, all) => all.findIndex((x) => x.id === s.id) === i);
+  ).filter((s, i, all) => all.findIndex((x) => x.id === s.id) === i).map(withUpdate);
   let builtin = buildBuiltin();
   let custom = readJson(KEY, []).filter((s) => !builtin.some((b) => b.id === s.id));
   // Les autres langues et les sources 18+ ne sont chargées que si on les demande (démarrage plus léger).
@@ -142,6 +159,60 @@
     return m ? "https://drive.google.com/uc?export=download&id=" + m[1] : u;
   };
 
+  // Listes officielles (celles de Weebox) : on n'y cherche que des versions plus récentes de sources déjà présentes.
+  const LISTS = {
+    fr: "https://drive.google.com/file/d/1mj_4l7ZpEQexcmdx4XhLv7VtaErJawbr/view?usp=sharing",
+    anix: "https://anix-linux.vercel.app/extensions",
+    adult: "https://drive.google.com/file/d/1P351e7jv-g6JHq-M79G0Mzwp-OtF1jHy/view?usp=sharing",
+  };
+  const autoUpd = () => store.get(UPD_AUTO) !== "0";
+  let checking = null;
+  function checkUpdates() {
+    if (checking) return checking;
+    checking = (async () => {
+      const known = new Map();
+      builtin.concat(custom).forEach((x) => known.set(x.id, x));
+      const todo = [["Sources FR", LISTS.fr]];
+      if (moreLoaded || active().some((x) => x.id === "nekosama")) todo.push(["Extensions Anix", LISTS.anix]);
+      if (moreLoaded && adultOn) todo.push(["Sources +18", LISTS.adult]);
+      const rep = { at: Date.now(), updated: [], errors: [] };
+      let reached = 0;
+      for (const [label, link] of todo) {
+        try {
+          const r = await withTimeout(fetch(driveDirect(link)), 30000);
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          const list = normalize(JSON.parse(await r.text()));
+          reached++;
+          for (const p of list) {
+            const cur = known.get(p.id);
+            if (!cur || !isNewer(p.version, cur.version)) continue; // jamais de nouvelle source ajoutée toute seule
+            try { providers.delete(p.id); providerOf(p); }
+            catch (e) { providers.delete(p.id); rep.errors.push(p.name + " " + p.version + " ignorée (" + msg(e) + ")"); continue; }
+            if (cur.group === "custom") {
+              const i = custom.findIndex((x) => x.id === p.id);
+              if (i >= 0) custom[i] = Object.assign({}, custom[i], { version: p.version, payload: p.payload, description: p.description || custom[i].description, languages: p.languages || custom[i].languages });
+            } else {
+              updates[p.id] = { version: p.version, payload: p.payload, description: p.description || "", languages: p.languages || null };
+            }
+            rep.updated.push(cur.name + " " + (cur.version || "?") + " → " + p.version);
+          }
+        } catch (e) {
+          rep.errors.push(label + " : " + msg(e));
+        }
+      }
+      if (rep.updated.length) {
+        store.set(UPD, JSON.stringify(updates));
+        saveCustom();
+        builtin = buildBuiltin();
+      }
+      if (reached) store.set(UPD_AT, String(Date.now())); // hors connexion : on réessaiera au prochain lancement
+      store.set(UPD_LOG, JSON.stringify(rep));
+      if (rep.errors.length) logErr("mise à jour", rep.errors.join(" ; "));
+      return rep;
+    })().finally(() => { checking = null; });
+    return checking;
+  }
+
   async function addFromUrl(link) {
     let r;
     try {
@@ -192,16 +263,17 @@
   let homeData = null;
   function loadHome() {
     if (homeData) return Promise.resolve(homeData);
-    const cached = readJson("riochi.home", null);
+    const cached = readJson("riochi.home2", null);
     const fresh = cached && cached.data && Date.now() - cached.at < 6 * 3600 * 1000;
     const now = new Date();
     const season = ["WINTER", "SPRING", "SUMMER", "FALL"][Math.floor(now.getMonth() / 3)];
     const q = `query($season:MediaSeason,$year:Int){
       trending:Page(perPage:12){media(type:ANIME,sort:TRENDING_DESC,isAdult:false){${MEDIA}}}
       season:Page(perPage:12){media(type:ANIME,season:$season,seasonYear:$year,sort:POPULARITY_DESC,isAdult:false){${MEDIA}}}
+      films:Page(perPage:12){media(type:ANIME,format:MOVIE,sort:POPULARITY_DESC,isAdult:false){${MEDIA}}}
       top:Page(perPage:12){media(type:ANIME,sort:SCORE_DESC,isAdult:false){${MEDIA}}}}`;
     const fetchIt = () => anilist(q, { season, year: now.getFullYear() }).then((d) => {
-      store.set("riochi.home", JSON.stringify({ at: Date.now(), data: d }));
+      store.set("riochi.home2", JSON.stringify({ at: Date.now(), data: d }));
       return d;
     });
     if (cached && cached.data) {
@@ -217,9 +289,13 @@
 
   function viewSearch() {
     const main = $("#main");
-    const input = el("input", { type: "search", id: "q", placeholder: "Titre d'un anime", autocomplete: "off", "aria-label": "Titre" });
+    const input = el("input", { type: "search", id: "q", placeholder: "Titre d'un anime ou d'un film", autocomplete: "off", "aria-label": "Titre" });
     input.value = lastQuery;
     const dub = el("input", { type: "checkbox", id: "dub" });
+    const kind = el("select", { id: "kind", "aria-label": "Type" },
+      el("option", { value: "" }, "Tout (séries, films…)"), el("option", { value: "TV" }, "Séries"),
+      el("option", { value: "MOVIE" }, "Films"), el("option", { value: "OVA" }, "OAV et spéciaux"));
+    const fmtOf = () => ({ TV: "format_in:[TV,TV_SHORT,ONA],", MOVIE: "format_in:[MOVIE],", OVA: "format_in:[OVA,SPECIAL]," })[kind.value] || "";
     dub.checked = lastDub;
     const sugg = el("div", { class: "sugg", hidden: true });
     const out = el("div", { id: "out" });
@@ -227,6 +303,7 @@
     main.replaceChildren(
       el("form", { onsubmit: (e) => { e.preventDefault(); sugg.hidden = true; run(); } },
         el("div", { class: "sw" }, input, sugg),
+        el("div", { class: "row" }, kind),
         el("label", { class: "chk", for: "dub" }, dub, "Version doublée (VF)")),
       out
     );
@@ -240,7 +317,7 @@
       timer = setTimeout(async () => {
         const token = ++suggToken;
         try {
-          const d = await anilist(`query($s:String){Page(perPage:6){media(type:ANIME,search:$s,sort:SEARCH_MATCH,isAdult:false){${MEDIA}}}}`, { s: q });
+          const d = await anilist(`query($s:String){Page(perPage:6){media(type:ANIME,search:$s,${fmtOf()}sort:SEARCH_MATCH,isAdult:false){${MEDIA}}}}`, { s: q });
           if (token !== suggToken) return;
           const list = d.Page.media;
           sugg.replaceChildren(...list.map((m) =>
@@ -249,6 +326,7 @@
         } catch (e) { sugg.hidden = true; }
       }, 300);
     });
+    kind.onchange = () => { if (input.value.trim().length >= 2) input.dispatchEvent(new Event("input")); else showHome(); };
     input.addEventListener("blur", () => setTimeout(() => { sugg.hidden = true; }, 200));
 
     function pick(m) {
@@ -262,6 +340,13 @@
       const token = ++searchToken;
       out.replaceChildren(el("p", { class: "empty" }, "Chargement des titres…"));
       try {
+        if (kind.value) {
+          const f = await anilist(`query{Page(perPage:30){media(type:ANIME,${fmtOf()}sort:POPULARITY_DESC,isAdult:false){${MEDIA}}}}`);
+          if (token !== searchToken) return;
+          out.replaceChildren(el("div", { class: "grid", style: "margin-top:20px" }, f.Page.media.map((m) =>
+            el("button", { class: "card", onclick: () => pick(m) }, poster(titleOf(m), m.coverImage && m.coverImage.large), el("b", {}, titleOf(m)), el("small", {}, metaOf(m))))));
+          return;
+        }
         const d = await loadHome();
         if (token !== searchToken) return;
         const shelf = (title, list) => [
@@ -270,7 +355,7 @@
             el("button", { class: "card", onclick: () => pick(m) },
               poster(titleOf(m), m.coverImage && m.coverImage.large), el("b", {}, titleOf(m)), el("small", {}, metaOf(m))))),
         ];
-        out.replaceChildren(...shelf("Tendances", d.trending.media), ...shelf("Populaires cette saison", d.season.media), ...shelf("Les mieux notés", d.top.media));
+        out.replaceChildren(...shelf("Tendances", d.trending.media), ...shelf("Populaires cette saison", d.season.media), ...(d.films ? shelf("Films", d.films.media) : []), ...shelf("Les mieux notés", d.top.media));
       } catch (e) {
         if (token !== searchToken) return;
         out.replaceChildren(
@@ -287,6 +372,9 @@
       out.replaceChildren(el("p", { class: "empty" }, "Recherche en cours…"));
       const token = ++searchToken;
       const asked = media || {};
+      let guessP = null;
+      const getGuess = () => guessP || (guessP = anilist(`query($s:String){Page(perPage:1){media(type:ANIME,search:$s,sort:SEARCH_MATCH,isAdult:false){${MEDIA}}}}`, { s: q })
+        .then((d) => (d.Page.media[0] ? toMedia(d.Page.media[0]) : null)).catch(() => null));
       const srcs = active();
       const results = new Array(srcs.length).fill(null);
       let pending = srcs.length;
@@ -300,6 +388,7 @@
           cards.length ? el("div", { class: "grid", style: "margin-top:20px" }, cards) : null,
           pending ? el("p", { class: "empty" }, "Recherche en cours… (" + (srcs.length - pending) + "/" + srcs.length + " sources)")
             : !cards.length ? el("p", { class: "empty" }, "Aucun résultat dans tes sources.") : null,
+          done.some((r) => r.widened) ? el("p", { class: "mut", style: "margin-top:12px" }, "Certains résultats viennent d'une recherche élargie : vérifie que c'est la bonne saison.") : null,
           ...errors,
           !pending && done.some((r) => r.error && /unreachable|Failed to fetch|NetworkError/i.test(r.error))
             ? el("p", { class: "mut" }, "Dans un navigateur, les sites d'anime bloquent les appels des plugins (CORS) : les sources FR ne marcheront que dans l'application Android.")
@@ -313,16 +402,30 @@
           const st = (p.getSettings && p.getSettings()) || {};
           if (lastDub && st.supportsDub === false) r = { src, items: [] };
           else {
-            const items = await withTimeout(p.search({ query: q, dub: lastDub, media: asked }), 30000);
-            r = { src, items: Array.isArray(items) ? items : [] };
+            let items = await withTimeout(p.search({ query: q, dub: lastDub, media: asked }), 30000);
+            items = Array.isArray(items) ? items : [];
+            let widened = false;
+            // Rien trouvé : on réessaie autrement (titre seul, ou fiche AniList la plus proche du texte tapé).
+            if (!items.length) {
+              const alt = Object.keys(asked).length ? {} : await getGuess();
+              if (alt) {
+                try {
+                  const more = await withTimeout(p.search({ query: q, dub: lastDub, media: alt }), 30000);
+                  if (Array.isArray(more) && more.length) { items = more; widened = true; }
+                } catch (e) { /* le premier résultat (vide) reste valable */ }
+              }
+            }
+            r = { src, items, widened };
           }
         } catch (e) {
           r = { src, items: [], error: msg(e) };
+          logErr("recherche " + src.name, q + " → " + msg(e));
         }
         results[n] = r;
         pending--;
         paint();
       }));
+      if (token === searchToken && !lastRes.length) logErr("recherche", q + " : aucun résultat (" + srcs.map((x) => x.name).join(", ") + ")");
     }
 
     if (lastQuery) run(); else showHome();
@@ -402,12 +505,37 @@
     const seek = (d) => { const v = $("#video"); v.currentTime = Math.max(0, v.currentTime + d); };
     $("#video").after(
       el("div", { id: "pctl" },
+        el("button", { type: "button", id: "pskip", class: "ac", hidden: true }, "Passer"),
         psrc, psel,
         el("button", { type: "button", "aria-label": "Reculer de 10 secondes", onclick: () => seek(-10) }, "⟲ 10 s"),
         el("button", { type: "button", "aria-label": "Avancer de 10 secondes", onclick: () => seek(10) }, "10 s ⟳"),
+        el("button", { type: "button", "aria-label": "Avancer de 85 secondes (passer l'opening)", onclick: () => seek(85) }, "⏭ 85 s"),
+        el("button", { type: "button", id: "pdl", onclick: downloadEpisode }, "⬇ Télécharger"),
         el("button", { type: "button", id: "pfs", onclick: () => setCinema(!$("#player").classList.contains("cinema")) }, "⛶ Plein écran")),
       el("p", { class: "mut", id: "pstat", role: "status" })
     );
+  }
+
+  // Télécharge l'épisode en cours (fichiers MP4 directs). Android : gestionnaire de téléchargements ; Windows : dossier Téléchargements.
+  async function downloadEpisode() {
+    const stat = $("#pstat"), s = session, last = s && s.last;
+    if (!last) { stat.textContent = "Lance d'abord un épisode."; return; }
+    const isHlsC = (c) => c.type === "m3u8" || /\.m3u8(\?|$)/.test(c.url);
+    const pick = !isHlsC(last.choices[last.k]) ? last.choices[last.k] : last.choices.find((c) => !isHlsC(c));
+    if (!pick) { stat.textContent = "Cet épisode n'est proposé qu'en flux HLS (.m3u8) : le téléchargement n'est pas encore possible pour ce type de flux. Essaie une autre source ou un autre serveur."; return; }
+    const ep = s.entries[0].episodes[s.index];
+    const name = (s.title + " - Episode " + (ep.number ?? s.index + 1)).replace(/[\\/:*?"<>|]+/g, " ").replace(/\s+/g, " ").trim() + ".mp4";
+    try {
+      let res;
+      if (window.RiochiNative && window.RiochiNative.download) res = JSON.parse(window.RiochiNative.download(pick.url, JSON.stringify(pick.headers || {}), name));
+      else if (window.__riochiNative && window.__riochiNative.download) res = await window.__riochiNative.download({ url: pick.url, headers: pick.headers || {}, name });
+      else { window.open(pick.url, "_blank"); stat.textContent = "Ouvert dans le navigateur : fais « Enregistrer sous » pour le garder."; return; }
+      stat.textContent = res && res.ok ? "Téléchargement lancé : " + name + (res.where ? " (" + res.where + ")" : "") : "Téléchargement impossible : " + ((res && res.error) || "erreur inconnue");
+      if (!(res && res.ok)) logErr("téléchargement", name + " : " + ((res && res.error) || "erreur inconnue"));
+    } catch (e) {
+      stat.textContent = "Téléchargement impossible : " + msg(e);
+      logErr("téléchargement", name + " : " + msg(e));
+    }
   }
 
   // Plein écran : la fenêtre remplit l'écran et on demande le mode paysage (si le système le permet).
@@ -471,7 +599,7 @@
     for (const r of results) {
       if (!r || !Array.isArray(r.videoSources)) continue;
       for (const v of r.videoSources) {
-        if (v && v.url) choices.push({ url: v.url, type: v.type, headers: r.headers || {}, subtitles: v.subtitles || [], label: [entry.src.name, r.server || v.label, v.quality].filter(Boolean).join(" · ") });
+        if (v && v.url) choices.push({ url: v.url, type: v.type, headers: r.headers || {}, subtitles: v.subtitles || [], skip: r.skip || null, label: [entry.src.name, r.server || v.label, v.quality].filter(Boolean).join(" · ") });
       }
     }
     return { choices, errors };
@@ -490,6 +618,8 @@
     stopVideo();
     sel.hidden = true;
     sel.replaceChildren();
+    const skipBtn = $("#pskip");
+    if (skipBtn) skipBtn.hidden = true;
     psrc.replaceChildren(...s.entries.map((e, k) => el("option", { value: k }, e.src.name)));
     psrc.value = String(s.cur);
     psrc.hidden = s.entries.length < 2;
@@ -505,6 +635,7 @@
         const net = netLog.length ? " Requêtes refusées : " + netLog.join(" ; ") + "." : "";
         const hint = s.entries.length < 2 ? " Aucune autre source n'a trouvé cet anime : active d'autres sources dans l'onglet Sources puis relance la recherche." : "";
         stat.textContent = "Aucun flux disponible. " + log.join(" | ") + net + hint;
+        logErr("lecture", s.title + " ép. " + (base.number ?? i + 1) + " : " + log.join(" | ") + net);
         return;
       }
       const k = order[pos], entry = s.entries[k];
@@ -571,6 +702,18 @@
     v.onplaying = v.oncanplay = () => { stat.textContent = ""; };
     v.addEventListener("playing", () => { if (token === playToken) markSeen(); }, { once: true });
     v.onwaiting = () => { if (!v.paused) stat.textContent = "Mise en mémoire…"; };
+    session.last = { choices, k };
+    // Bouton « Passer l'opening / l'ending » quand la source donne les durées (certaines sources anglaises).
+    v.ontimeupdate = () => {
+      const sk = c.skip, b = $("#pskip");
+      if (!b) return;
+      const t = v.currentTime;
+      let to = null, label = "";
+      if (sk && sk.introEnd > sk.introStart && t >= sk.introStart && t < sk.introEnd - 1) { to = sk.introEnd; label = "Passer l'opening"; }
+      else if (sk && sk.outroEnd > sk.outroStart && t >= sk.outroStart && t < sk.outroEnd - 1) { to = sk.outroEnd; label = "Passer l'ending"; }
+      b.hidden = to === null;
+      if (to !== null) { b.textContent = label; b.onclick = () => { v.currentTime = to; }; }
+    };
     stat.textContent = "Chargement : " + (c.label || "flux") + "…";
 
     const isHls = c.type === "m3u8" || /\.m3u8(\?|$)/.test(c.url);
@@ -671,6 +814,39 @@
       }));
     }
 
+    const diag = el("details", { style: "margin-top:18px" },
+      el("summary", { class: "mut" }, "Diagnostic (en cas de problème)"),
+      el("pre", { style: "white-space:pre-wrap;font-size:12px;color:var(--mut);padding:8px 0" }, errLog.length ? errLog.join("\n") : "Aucune erreur enregistrée."),
+      el("button", { type: "button", onclick: async (ev) => {
+        try { await navigator.clipboard.writeText(errLog.join("\n") || "Aucune erreur enregistrée."); ev.target.textContent = "Copié ✓"; }
+        catch (e) { ev.target.textContent = "Copie impossible : sélectionne le texte"; }
+      } }, "Copier le diagnostic"));
+    const updSt = el("p", { class: "mut", role: "status" });
+    const showUpd = () => {
+      const l = readJson(UPD_LOG, null);
+      updSt.textContent = l
+        ? "Dernière vérification : " + new Date(l.at).toLocaleString("fr-FR") + (l.updated.length ? " — mises à jour : " + l.updated.join(", ") + "." : " — tout est à jour.") + (l.errors.length ? " Problèmes : " + l.errors.join(" ; ") : "")
+        : "Pas encore vérifié.";
+    };
+    const autoBox = el("input", { type: "checkbox", id: "autoupd" });
+    autoBox.checked = autoUpd();
+    autoBox.onchange = () => store.set(UPD_AUTO, autoBox.checked ? "1" : "0");
+    const updBox = el("div", { style: "margin-top:18px" },
+      el("h3", { style: "font-size:17px;margin-bottom:6px" }, "Mises à jour des sources"),
+      el("p", { class: "mut" }, "Les sources sont des plugins : quand leur auteur en publie une version plus récente (souvent une réparation), Riochi peut la récupérer sans nouvelle installation. Les listes utilisées sont celles de Weebox ; décoche l'option si tu ne leur fais pas confiance."),
+      el("label", { class: "chk", for: "autoupd" }, autoBox, "Mettre à jour automatiquement (au plus toutes les 12 h)"),
+      el("div", { class: "row" },
+        el("button", { type: "button", onclick: async (ev) => {
+          ev.target.disabled = true; updSt.textContent = "Vérification…";
+          try { await checkUpdates(); } catch (e) { logErr("mise à jour", msg(e)); }
+          ev.target.disabled = false; showUpd(); renderList();
+        } }, "Vérifier maintenant"),
+        el("button", { type: "button", onclick: () => {
+          updates = {}; store.set(UPD, "{}"); providers.clear(); builtin = buildBuiltin();
+          updSt.textContent = "Versions d'origine rétablies."; renderList();
+        } }, "Revenir aux versions d'origine")),
+      updSt);
+    showUpd();
     main.replaceChildren(
       el("h2", {}, "Sources"),
       el("p", { class: "mut" }, "Une source est un plugin au format Weebox. Les sources FR, les extensions Anix et les sources adultes sont déjà intégrées : coche celles que tu veux utiliser. Ajouter une source par lien ou fichier exécute son code sur cet appareil : n'ajoute que des liens ou des fichiers de confiance."),
@@ -684,7 +860,9 @@
       st,
       el("label", { class: "chk", for: "adult" }, adult, "Afficher les sources adultes (réservé aux personnes majeures, 18+)"),
       summary,
-      list
+      list,
+      updBox,
+      diag
     );
     file.onchange = async () => {
       const f = file.files[0];
@@ -705,6 +883,9 @@
   $("#pnext").addEventListener("click", () => session && session.index < session.entries[0].episodes.length - 1 && playEpisode(session.index + 1));
 
   if (adultOn) loadMore().catch(() => {});
+  setTimeout(() => {
+    if (autoUpd() && Date.now() - (Number(store.get(UPD_AT)) || 0) > 12 * 3600 * 1000) checkUpdates().catch(() => {});
+  }, 6000);
   // Le lecteur HLS se charge en arrière-plan, sans bloquer l'affichage.
   setTimeout(() => { loadHls(); }, 1500);
   show("search");
